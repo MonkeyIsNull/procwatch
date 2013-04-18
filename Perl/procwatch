@@ -1,0 +1,192 @@
+#!/usr/local/bin/perl
+# Procwatch
+# Watches the proc file system for new processes 
+# and then spits out to STDOUT, or a logfile, the timestamp, the
+# username, the pid  and the binary that was run.
+# procwatch -h for usage
+# 
+# Adam Guyot <aguyot@speakeasy.net> http://www.speakeasy.net/~aguyot
+# Copyright (c) 2001 Adam Guyot.  All rights reserved.
+# This program is free software; you can redistibute 
+# it and/or modify it under the terms of
+# the Artistic License, distributed with Perl.
+
+
+use strict;
+use Getopt::Std;
+
+# Process options
+my %Opts;
+getopts('Dhcl:', \%Opts);
+
+&usage() if $Opts{h};
+&daemonize() if $Opts{D};
+
+# Master  process list
+my $Master_procs;
+
+# Time to exit
+my $Suicide = undef;
+
+# Link name in the proc fs is dependent on OS platform
+# By default we will use Linuxs idea of the exe file
+my $Linkname = 'exe';
+$Linkname = 'file' if $^O =~ /freebsd/;
+
+# List of the History of the procs
+# For next version
+# my $Historic_procs = [ ];
+
+# Install the signal handlers
+$SIG{INT} = $SIG{TERM} = $SIG{HUP} = \&sig_handler;
+
+# Get Master process listing
+# After some time you will want to retrigger
+# them or the list continues to grow, the pids
+# start to wrap etc. etc. etc.
+$Master_procs = &get_procs();
+
+
+# Enter infinite loop
+until($Suicide) {
+	# sleep 1 second and get process list again.
+	# Warning! This is a race condition. Try with
+	# different time to see what is really suitable
+	sleep 1;
+	my $procs = &get_procs();
+	
+
+	#compare the diff
+	my $diff = &diff_procs($procs);
+
+	# Match the current to the master list
+	# this is so we reap the old processes.
+	# This code here is a nice big old race 
+	# condition. Stuff will slip by in between
+	# the cracks!
+	@$Master_procs = map { $_ } @$procs;
+	
+	#if there is a new process
+	if(defined($diff)) {
+		#get timestamp for right now
+		my $timestamp = &get_time();
+		
+		# Match pids to username and
+		# translate the new pids into filenames
+		$diff = &translate_pids($diff);
+		
+		# chirp a warning
+		&chirp($timestamp,$diff);
+	}
+	#loop back to sleep
+}
+
+#Get  process list
+sub get_procs {
+	# Init an array for the processes pids
+	# and a ref to an array  for their names
+	my @proc_pids;
+	my $proc_names;
+
+	# Open the directory and fill the array
+	opendir(PROC, "/proc") || die "Cannot open the proc dir for reading !$\n";
+	@proc_pids = grep { /\d/ } readdir(PROC);
+	
+	#return the translated names 
+	return(\@proc_pids);
+}
+
+# Translates all pids to the corresponding filename
+# and matches the uid of the process to a username
+# and returns a ref to an array where each entry is
+# an anon array of two elements
+sub translate_pids {
+	my ($proc_pids) = @_;
+
+	# instead of using getpwuid it should be loaded up
+	# with a uid=>name hash. Will get to that later.
+	my @proc_names = map { 
+		my $link_name = readlink "/proc/$_/$Linkname" ;
+		my $uid = getpwuid((stat("/proc/$_"))[4]);
+		my $record = [ $uid, $_, $link_name ];
+	} @$proc_pids;
+
+	return \@proc_names;
+}
+
+#Compare two arrays of pids
+sub diff_procs {
+	my ($pids) = @_;
+	# build a seen table
+	my %seen = ();
+	my @diff;
+
+	@seen{@$Master_procs} = ();
+
+	#if there is a diff between master and new
+	foreach my $p (@$pids) {
+		push(@diff, $p) unless exists $seen{$p};
+	}
+
+	if(defined($diff[0])) {
+		#save new to master and return the difference
+		push(@$Master_procs, @diff);
+		return(\@diff);	
+	} else {
+		return undef;
+	}
+
+}
+
+#Get timestamp
+sub get_time {
+	return(localtime);
+}
+
+#Chirp a warning
+#spit out the timestamp and the list of new processes
+sub chirp {
+	my($timestamp,$diff) = @_;
+	print "$timestamp: ";
+
+	foreach(@$diff) {
+		print "$_->[0] ($_->[1]) => [ $_->[2] ] ";
+	}
+	print "\n";
+}
+
+# SigHandler
+# Anything we get we want to suicide
+sub sig_handler {
+    $Suicide = 1;
+    close(LOG) if $Opts{l};
+}
+
+# Daemonize the whole thing
+sub daemonize {
+    &usage() if !defined($Opts{l});
+    require POSIX;
+    POSIX::setsid() or die "Cannot start new session !$\n";
+    my $p = fork;
+    exit if $p;
+    die "Fatality! Can't fork: $!" unless defined($p);
+
+    &init_logging();
+}
+
+# Select 
+sub init_logging {
+    open(LOG, ">$Opts{l}") or die "Fatality! Cannot open logfile $!\n";
+    chmod 0600, $Opts{l} if $Opts{c};
+    select(LOG);
+    select((select(LOG), $| =1)[0]);
+}
+
+sub usage {
+    print(STDERR "procwatch [-D [-c] -l logname]\n");
+    print(STDERR "-D Daemonizes itself\n-l loggingtofilename\n");
+    print(STDERR "-c (chmods the logfile to 0600)\n");
+    print(STDERR "-h this help\n");
+    exit;
+}
+
